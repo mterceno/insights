@@ -1,0 +1,546 @@
+From 751f50ed5c3faba6dad214b5d08e914ba2a4f0c5 Mon Sep 17 00:00:00 2001
+From: shahzeelahmed <ahmedshahzeel@gmail.com>
+Date: Wed, 18 Feb 2026 16:58:10 +0530
+Subject: [PATCH 1/8] fix: validate resource name and public key in API
+ functions
+
+---
+ insights/api/public.py | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/insights/api/public.py b/insights/api/public.py
+index 8d79de46..df813604 100644
+--- a/insights/api/public.py
++++ b/insights/api/public.py
+@@ -13,6 +13,8 @@ def get_public_key(resource_type, resource_name):
+         get_dashboard_public_key,
+     )
+ 
++    if not isinstance(resource_name, str):
++        frappe.throw("Invalid resource name")
+     if resource_type == "Insights Dashboard":
+         return get_dashboard_public_key(resource_name)
+     if resource_type == "Insights Chart":
+@@ -40,18 +42,22 @@ def get_public_chart(public_key):
+     if not public_key or not isinstance(public_key, str):
+         frappe.throw("Public Key is required")
+ 
+-    chart_name = frappe.db.exists("Insights Chart", {"public_key": public_key, "is_public": 1})
++    chart_name = frappe.db.exists(
++        "Insights Chart", {"public_key": public_key, "is_public": 1}
++    )
+     if not chart_name:
+         frappe.throw("Invalid Public Key")
+ 
+-    chart = frappe.get_cached_doc("Insights Chart", chart_name).as_dict(no_default_fields=True)
++    chart = frappe.get_cached_doc("Insights Chart", chart_name).as_dict(
++        no_default_fields=True
++    )
+     chart_data = frappe.get_cached_doc("Insights Query", chart.query).fetch_results()
+     chart["data"] = chart_data
+     return chart
+ 
+ 
+ @frappe.whitelist(allow_guest=True)
+-def get_public_dashboard_chart_data(public_key, *args, **kwargs):
++def get_public_dashboard_chart_data(public_key, item_id, filters=None):
+     if not public_key or not isinstance(public_key, str):
+         frappe.throw("Public Key is required")
+ 
+@@ -61,9 +67,8 @@ def get_public_dashboard_chart_data(public_key, *args, **kwargs):
+     if not dashboard_name:
+         frappe.throw("Invalid Public Key")
+ 
+-    kwargs.pop("cmd")
+     return frappe.get_cached_doc("Insights Dashboard", dashboard_name).fetch_chart_data(
+-        *args, **kwargs
++        item_id=item_id, filters=filters
+     )
+ 
+ 
+-- 
+2.52.0
+
+
+From 2d8e874edcebf9c6e3a355c056b9609d2e7af4e7 Mon Sep 17 00:00:00 2001
+From: shahzeelahmed <ahmedshahzeel@gmail.com>
+Date: Wed, 18 Feb 2026 16:58:47 +0530
+Subject: [PATCH 2/8] fix: enhance validation and permission checks in
+ InsightsAlert class
+
+---
+ .../doctype/insights_alert/insights_alert.py  | 69 ++++++++++++++++---
+ 1 file changed, 58 insertions(+), 11 deletions(-)
+
+diff --git a/insights/insights/doctype/insights_alert/insights_alert.py b/insights/insights/doctype/insights_alert/insights_alert.py
+index dcb31511..3c60829c 100644
+--- a/insights/insights/doctype/insights_alert/insights_alert.py
++++ b/insights/insights/doctype/insights_alert/insights_alert.py
+@@ -1,17 +1,25 @@
+ # Copyright (c) 2023, Frappe Technologies Pvt. Ltd. and contributors
+ # For license information, please see license.txt
+ from datetime import datetime
++import re
+ 
+ import frappe
+ from croniter import croniter
+ from frappe.model.document import Document
+-from frappe.utils import validate_email_address
++from frappe.utils import validate_email_address, md_to_html
+ from frappe.utils.data import get_datetime, get_datetime_str, now_datetime
+ from pandas import DataFrame
+ 
+ 
+ class InsightsAlert(Document):
+     def validate(self):
++
++        if self.disabled:
++            return
++
++        if self.query:
++            self.has_query_permission()
++
+         try:
+             self.evaluate_condition(for_validate=True)
+         except Exception as e:
+@@ -45,7 +53,9 @@ class InsightsAlert(Document):
+ 
+     def evaluate_condition(self, for_validate=False):
+         query = frappe.get_doc("Insights Query", self.query)
+-        results = query.fetch_results() if not for_validate else query.retrieve_results()
++        results = (
++            query.fetch_results() if not for_validate else query.retrieve_results()
++        )
+ 
+         if not results:
+             return False
+@@ -53,18 +63,26 @@ class InsightsAlert(Document):
+         column_names = [d.get("label") for d in results[0]]
+         results = DataFrame(results[1:], columns=column_names)
+ 
+-        return frappe.safe_eval(self.condition, eval_locals=frappe._dict(results=results, any=any))
++        return frappe.safe_eval(
++            self.condition, eval_locals=frappe._dict(results=results, any=any)
++        )
++
++    def has_query_permission(self):
++        if not frappe.has_permission("Insights Query", "read", self.query):
++            frappe.throw("You do not have permission to access this query")
+ 
+     def evaluate_message(self):
+-        query = frappe.get_doc("Insights Query", self.query)
+-        query_dict = query.as_dict()
+-        # query_dict.results = f"""<div class="results">{query.get_formatted_results(as_html=True)}</div>"""
+-        message = frappe.render_template(self.message, context=query_dict)
++        rows_pattern = r"{{\s*rows\s*}}"
++        message_md = re.sub(rows_pattern, "{{ datatable }}", self.message)
++
++        context = self.get_message_context()
++        message_md = render_template_restricted(message_md, context)
+         if self.channel == "Telegram":
+-            return message
++            return message_md
+ 
++        message_html = md_to_html(message_md)
+         return frappe.render_template(
+-            "insights/templates/alert.html", context=frappe._dict(message=message)
++            "insights/templates/alert.html", context=frappe._dict(message=message_html)
+         )
+ 
+     def get_recipients(self):
+@@ -108,9 +126,34 @@ def send_alerts():
+             frappe.db.commit()
+ 
+ 
++def render_template_restricted(template: str, context: dict) -> str:
++    """Render a Jinja template with a restricted sandbox environment.
++
++    Only allows access to explicitly passed context variables and basic filters.
++    Does not expose frappe utilities or other globals.
++
++    Uses the same sandboxed environment as frappe.render_template but without
++    the get_safe_globals() that would expose frappe internals.
++    """
++    from frappe.utils.jinja import _get_jenv
++
++    base_jenv = _get_jenv()
++
++    # Create an overlay to avoid modifying the cached instance
++    jenv = base_jenv.overlay()
++
++    # Copy filters but do NOT add get_safe_globals() or jinja hooks
++    jenv.filters = base_jenv.filters.copy()
++
++    compiled_template = jenv.from_string(template)
++    return compiled_template.render(context)
++
++
+ class Telegram:
+     def __init__(self, chat_id: str = None):
+-        self.token = frappe.get_single("Insights Settings").get_password("telegram_api_token")
++        self.token = frappe.get_single("Insights Settings").get_password(
++            "telegram_api_token"
++        )
+         if not self.token:
+             frappe.throw("Telegram Bot Token not set in Insights Settings")
+ 
+@@ -119,10 +162,13 @@ class Telegram:
+ 
+     def send(self, message):
+         import telegram
++
+         try:
+             text = message[: telegram.MAX_MESSAGE_LENGTH]
+             parse_mode = telegram.ParseMode.MARKDOWN
+-            return self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode=parse_mode)
++            return self.bot.send_message(
++                chat_id=self.chat_id, text=text, parse_mode=parse_mode
++            )
+         except Exception:
+             frappe.log_error("Telegram Bot Error")
+             raise
+@@ -130,4 +176,5 @@ class Telegram:
+     @property
+     def bot(self):
+         import telegram
++
+         return telegram.Bot(token=self.token)
+-- 
+2.52.0
+
+
+From b59b958c74c3e1e73e9817f42f86f6482704ff95 Mon Sep 17 00:00:00 2001
+From: shahzeelahmed <ahmedshahzeel@gmail.com>
+Date: Wed, 18 Feb 2026 16:58:57 +0530
+Subject: [PATCH 3/8] fix: add public access validation in get_chart_public_key
+ function
+
+---
+ insights/insights/doctype/insights_chart/insights_chart.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/insights/insights/doctype/insights_chart/insights_chart.py b/insights/insights/doctype/insights_chart/insights_chart.py
+index c59573dc..33d58f8a 100644
+--- a/insights/insights/doctype/insights_chart/insights_chart.py
++++ b/insights/insights/doctype/insights_chart/insights_chart.py
+@@ -10,6 +10,12 @@ class InsightsChart(Document):
+ 
+ 
+ def get_chart_public_key(name):
++
++    is_public = frappe.db.get_value("Insights Chart", name, "is_public")
++    if not is_public:
++        frappe.throw("Chart is not public")
++        return
++
+     existing_key = frappe.db.get_value("Insights Chart", name, "public_key", cache=True)
+     if existing_key:
+         return existing_key
+-- 
+2.52.0
+
+
+From fbb7bec7353bb19d78b88d8dd4330bb2c249ec0c Mon Sep 17 00:00:00 2001
+From: shahzeelahmed <ahmedshahzeel@gmail.com>
+Date: Wed, 18 Feb 2026 16:59:19 +0530
+Subject: [PATCH 4/8] fix: add permission checks for fetching chart data and
+ retrieving public key
+
+---
+ .../insights_dashboard/insights_dashboard.py   | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/insights/insights/doctype/insights_dashboard/insights_dashboard.py b/insights/insights/doctype/insights_dashboard/insights_dashboard.py
+index 0e608350..53610bd6 100644
+--- a/insights/insights/doctype/insights_dashboard/insights_dashboard.py
++++ b/insights/insights/doctype/insights_dashboard/insights_dashboard.py
+@@ -59,6 +59,11 @@ class InsightsDashboard(Document):
+ 
+     @frappe.whitelist()
+     def fetch_chart_data(self, item_id, query_name=None, filters=None):
++
++        if query_name:
++            if not frappe.has_permission("Insights Query", "read", query_name):
++                frappe.throw("You are not permitted to access this query")
++                return
+         row = next((row for row in self.items if row.item_id == item_id), None)
+         if not row and not query_name:
+             return frappe.throw("Item not found")
+@@ -84,7 +89,9 @@ class InsightsDashboard(Document):
+             "Insights Settings", "query_result_expiry"
+         )
+         query_result_expiry_in_seconds = query_result_expiry * 60
+-        frappe.cache().set_value(key, new_results, expires_in_sec=query_result_expiry_in_seconds)
++        frappe.cache().set_value(
++            key, new_results, expires_in_sec=query_result_expiry_in_seconds
++        )
+         return new_results
+ 
+ 
+@@ -139,7 +146,14 @@ def get_query_columns(query):
+ 
+ 
+ def get_dashboard_public_key(name):
+-    existing_key = frappe.db.get_value("Insights Dashboard", name, "public_key", cache=True)
++
++    is_public = frappe.db.get_value("Insights Dashboard", name, "is_public")
++    if not is_public:
++        frappe.throw("Dashboard is not public")
++
++    existing_key = frappe.db.get_value(
++        "Insights Dashboard", name, "public_key", cache=True
++    )
+     if existing_key:
+         return existing_key
+ 
+-- 
+2.52.0
+
+
+From b7d14a3f50bce261c60c035836e56b626ddc3d0e Mon Sep 17 00:00:00 2001
+From: shahzeelahmed <ahmedshahzeel@gmail.com>
+Date: Thu, 19 Feb 2026 13:34:38 +0530
+Subject: [PATCH 5/8] fix: add type checks
+
+---
+ .../insights/doctype/insights_alert/insights_alert.py  | 10 ++++------
+ .../insights/doctype/insights_chart/insights_chart.py  |  5 ++++-
+ .../doctype/insights_dashboard/insights_dashboard.py   |  9 ++++++---
+ 3 files changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/insights/insights/doctype/insights_alert/insights_alert.py b/insights/insights/doctype/insights_alert/insights_alert.py
+index 3c60829c..b7f640ad 100644
+--- a/insights/insights/doctype/insights_alert/insights_alert.py
++++ b/insights/insights/doctype/insights_alert/insights_alert.py
+@@ -1,8 +1,6 @@
+ # Copyright (c) 2023, Frappe Technologies Pvt. Ltd. and contributors
+ # For license information, please see license.txt
+ from datetime import datetime
+-import re
+-
+ import frappe
+ from croniter import croniter
+ from frappe.model.document import Document
+@@ -72,11 +70,11 @@ class InsightsAlert(Document):
+             frappe.throw("You do not have permission to access this query")
+ 
+     def evaluate_message(self):
+-        rows_pattern = r"{{\s*rows\s*}}"
+-        message_md = re.sub(rows_pattern, "{{ datatable }}", self.message)
+ 
+-        context = self.get_message_context()
+-        message_md = render_template_restricted(message_md, context)
++        query = frappe.get_doc("Insights Query", self.query)
++        context = query.as_dict()
++
++        message_md = render_template_restricted(self.message, context)
+         if self.channel == "Telegram":
+             return message_md
+ 
+diff --git a/insights/insights/doctype/insights_chart/insights_chart.py b/insights/insights/doctype/insights_chart/insights_chart.py
+index 33d58f8a..12375a06 100644
+--- a/insights/insights/doctype/insights_chart/insights_chart.py
++++ b/insights/insights/doctype/insights_chart/insights_chart.py
+@@ -9,7 +9,10 @@ class InsightsChart(Document):
+     pass
+ 
+ 
+-def get_chart_public_key(name):
++def get_chart_public_key(name:str):
++
++    if not frappe.db.exists("Insights Chart", name):
++        frappe.throw("Chart not found")
+ 
+     is_public = frappe.db.get_value("Insights Chart", name, "is_public")
+     if not is_public:
+diff --git a/insights/insights/doctype/insights_dashboard/insights_dashboard.py b/insights/insights/doctype/insights_dashboard/insights_dashboard.py
+index 53610bd6..951b783e 100644
+--- a/insights/insights/doctype/insights_dashboard/insights_dashboard.py
++++ b/insights/insights/doctype/insights_dashboard/insights_dashboard.py
+@@ -58,9 +58,9 @@ class InsightsDashboard(Document):
+         notify(**{"type": "success", "title": "Cache Cleared"})
+ 
+     @frappe.whitelist()
+-    def fetch_chart_data(self, item_id, query_name=None, filters=None):
++    def fetch_chart_data(self, item_id, query_name:str = None, filters=None):
+ 
+-        if query_name:
++        if query_name and not self.is_public:
+             if not frappe.has_permission("Insights Query", "read", query_name):
+                 frappe.throw("You are not permitted to access this query")
+                 return
+@@ -145,7 +145,10 @@ def get_query_columns(query):
+     return frappe.get_cached_doc("Insights Query", query).fetch_columns()
+ 
+ 
+-def get_dashboard_public_key(name):
++def get_dashboard_public_key(name: str):
++
++    if not frappe.db.exists("Insights Dashboard", name):
++        frappe.throw("Dashboard not found")
+ 
+     is_public = frappe.db.get_value("Insights Dashboard", name, "is_public")
+     if not is_public:
+-- 
+2.52.0
+
+
+From c2d6feda35e1e00640f00bc9b9177cbb292563cb Mon Sep 17 00:00:00 2001
+From: Saqib Ansari <nextchamp.saqib@gmail.com>
+Date: Sat, 21 Feb 2026 13:58:26 +0530
+Subject: [PATCH 6/8] fix: check role even if team perms are disabled
+
+---
+ insights/decorators.py | 15 +++++----------
+ 1 file changed, 5 insertions(+), 10 deletions(-)
+
+diff --git a/insights/decorators.py b/insights/decorators.py
+index 47aa9989..19213e71 100644
+--- a/insights/decorators.py
++++ b/insights/decorators.py
+@@ -14,17 +14,12 @@ def check_role(role):
+             if frappe.session.user == "Administrator":
+                 return function(*args, **kwargs)
+ 
+-            perm_disabled = not frappe.db.get_single_value(
+-                "Insights Settings", "enable_permissions"
+-            )
+-            if perm_disabled and role in ["Insights Admin", "Insights User"]:
+-                return function(*args, **kwargs)
++            user_roles = frappe.get_roles(frappe.session.user)
++            has_required_role = role in user_roles
++            if role == "Insights User" and "Insights Admin" in user_roles:
++                has_required_role = True
+ 
+-            if not frappe.db.get_value(
+-                "Has Role",
+-                {"parent": frappe.session.user, "role": role},
+-                cache=not frappe.flags.in_test,
+-            ):
++            if not has_required_role:
+                 frappe.throw(
+                     frappe._("You do not have permission to access this resource"),
+                     frappe.PermissionError,
+-- 
+2.52.0
+
+
+From c32cdbf0acf4c215fa9519136791fc6027bcbf11 Mon Sep 17 00:00:00 2001
+From: Saqib Ansari <nextchamp.saqib@gmail.com>
+Date: Sat, 21 Feb 2026 13:48:55 +0530
+Subject: [PATCH 7/8] fix: validate public key
+
+---
+ frontend/src/widgets/PivotTable/PivotTable.vue |  7 +++++--
+ insights/api/queries.py                        | 17 +++++++++++++++--
+ 2 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/frontend/src/widgets/PivotTable/PivotTable.vue b/frontend/src/widgets/PivotTable/PivotTable.vue
+index 2b9cd2ee..273f8daa 100644
+--- a/frontend/src/widgets/PivotTable/PivotTable.vue
++++ b/frontend/src/widgets/PivotTable/PivotTable.vue
+@@ -3,7 +3,7 @@ import ChartTitle from '@/components/Charts/ChartTitle.vue'
+ import TanstackTable from '@/components/Table/TanstackTable.vue'
+ import { watchDebounced } from '@vueuse/core'
+ import { call } from 'frappe-ui'
+-import { computed, ref, watch } from 'vue'
++import { computed, inject, ref, watch } from 'vue'
+ import { convertToNestedObject, convertToTanstackColumns } from './utils'
+ 
+ const props = defineProps({
+@@ -17,6 +17,7 @@ watch(_data, reloadPivotData, { deep: true })
+ const indexColumns = computed(() => props.options.rows?.map((column) => column.value) || [])
+ const pivotColumns = computed(() => props.options.columns?.map((column) => column.value) || [])
+ const valueColumns = computed(() => props.options.values?.map((column) => column.value) || [])
++const dashboard = inject('dashboard', null)
+ 
+ const pivotedData = ref([])
+ watchDebounced(
+@@ -29,15 +30,17 @@ watchDebounced(
+ 		deep: true,
+ 		immediate: true,
+ 		debounce: 500,
+-	}
++	},
+ )
+ 
+ function reloadPivotData() {
++	const publicKey = dashboard?.isPublic ? dashboard?.doc?.public_key : undefined
+ 	call('insights.api.queries.pivot', {
+ 		data: _data.value,
+ 		indexes: indexColumns.value,
+ 		columns: pivotColumns.value,
+ 		values: valueColumns.value,
++		...(publicKey ? { public_key: publicKey } : {}),
+ 	}).then((data) => (pivotedData.value = sortIndexKeys(data)))
+ }
+ 
+diff --git a/insights/api/queries.py b/insights/api/queries.py
+index f91f1d33..7c66d601 100644
+--- a/insights/api/queries.py
++++ b/insights/api/queries.py
+@@ -91,7 +91,20 @@ def pivot(
+     indexes: list[str] | None = None,
+     columns: list[str] | None = None,
+     values: list[str] | None = None,
++    public_key: str | None = None,
+ ):
++    if frappe.session.user == "Guest" or public_key:
++        if not isinstance(public_key, str) or not public_key.strip():
++            frappe.throw("Public Key is required")
++
++        if not frappe.db.exists(
++            "Insights Dashboard",
++            {"public_key": public_key, "is_public": 1},
++        ):
++            frappe.throw("Invalid Public Key")
++    else:
++        check_role("Insights User")
++
+     indexes = indexes or []
+     columns = columns or []
+     values = values or []
+@@ -133,12 +146,12 @@ def flatten_column_keys(pivoted_records: list[dict]):
+     for row in pivoted_records:
+         new_row = {}
+         cols = list(row.keys())
+-        if type(cols[0]) != tuple:
++        if not isinstance(cols[0], tuple):
+             new_records.append(row)
+             continue
+         for keys in cols:
+             first_key = keys[0]
+-            new_keys = list(keys[1:]) + [first_key]
++            new_keys = [*list(keys[1:]), first_key]
+             new_keys = [key for key in new_keys if key]
+             new_key = "___".join(new_keys)
+             new_row[new_key] = row[keys]
+-- 
+2.52.0
+
+
+From 57d1d053b91d6506fe1c546a534ecf451c595132 Mon Sep 17 00:00:00 2001
+From: Saqib Ansari <nextchamp.saqib@gmail.com>
+Date: Sat, 21 Feb 2026 14:05:52 +0530
+Subject: [PATCH 8/8] chore: bumped to 2.2.13
+
+---
+ insights/__init__.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/insights/__init__.py b/insights/__init__.py
+index a4aae753..df3d729c 100644
+--- a/insights/__init__.py
++++ b/insights/__init__.py
+@@ -2,7 +2,7 @@
+ # For license information, please see license.txt
+ 
+ 
+-__version__ = "2.2.12"
++__version__ = "2.2.13"
+ 
+ 
+ def notify(*args, **kwargs):
+-- 
+2.52.0
+
